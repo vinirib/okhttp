@@ -25,6 +25,7 @@ import assertk.assertions.isNotNull
 import assertk.assertions.isNull
 import assertk.assertions.isTrue
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.CookieManager
 import java.net.HttpURLConnection
 import java.net.ResponseCache
@@ -57,9 +58,11 @@ import okio.Buffer
 import okio.BufferedSink
 import okio.FileSystem
 import okio.ForwardingFileSystem
+import okio.ForwardingSink
 import okio.GzipSink
 import okio.Path
 import okio.Path.Companion.toPath
+import okio.Sink
 import okio.buffer
 import okio.fakefilesystem.FakeFileSystem
 import okio.use
@@ -1046,6 +1049,68 @@ class CacheTest {
     // Intentionally empty. This case doesn't make sense because there's no
     // such thing as a premature disconnect when the disconnect itself
     // indicates the end of the data stream.
+  }
+
+  /**
+   * An interrupt fails the cache write, and the thread's interrupt check then also fails the cleanup
+   * delete, consuming the interrupt flag. The truncated body must not be committed.
+   * https://github.com/square/okhttp/issues/9856
+   */
+  @Test
+  fun interruptedCacheWriteDoesNotCommitTruncatedResponse() {
+    var interrupted = false
+    var interruptedOnce = false
+    val interruptingFileSystem =
+      object : ForwardingFileSystem(fileSystem) {
+        override fun sink(
+          file: Path,
+          mustCreate: Boolean,
+        ): Sink {
+          val sink = super.sink(file, mustCreate)
+          // Only the dirty body file fails, not the journal or the entry metadata.
+          if (!file.name.endsWith(".1.tmp") || interruptedOnce) return sink
+          interruptedOnce = true
+          return object : ForwardingSink(sink) {
+            override fun write(
+              source: Buffer,
+              byteCount: Long,
+            ) {
+              interrupted = true
+              throw InterruptedIOException("interrupted")
+            }
+          }
+        }
+
+        override fun delete(
+          path: Path,
+          mustExist: Boolean,
+        ) {
+          if (interrupted && path.name.endsWith(".1.tmp")) {
+            interrupted = false
+            throw InterruptedIOException("interrupted")
+          }
+          super.delete(path, mustExist)
+        }
+      }
+    cache = Cache(interruptingFileSystem, "/interrupted-cache/".toPath(), Long.MAX_VALUE)
+    client = client.newBuilder().cache(cache).build()
+
+    val body = "A".repeat(64 * 1024)
+    server.enqueue(MockResponse.Builder().body(body).build())
+    server.enqueue(MockResponse.Builder().body(body).build())
+
+    val response = get(server.url("/"))
+    assertFailsWith<IOException> {
+      response.body.string()
+    }
+    response.close()
+    assertThat(cache.writeSuccessCount()).isEqualTo(0)
+    assertThat(cache.writeAbortCount()).isEqualTo(1)
+
+    val response2 = get(server.url("/"))
+    assertThat(response2.cacheResponse).isNull()
+    assertThat(response2.body.string()).isEqualTo(body)
+    assertThat(server.requestCount).isEqualTo(2)
   }
 
   private fun testServerPrematureDisconnect(transferKind: TransferKind) {

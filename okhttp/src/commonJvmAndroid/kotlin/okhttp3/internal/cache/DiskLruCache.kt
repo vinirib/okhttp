@@ -884,7 +884,14 @@ class DiskLruCache(
     internal fun detach() {
       if (entry.currentEditor == this) {
         if (civilizedFileSystem) {
-          completeEdit(this, false) // Delete it now.
+          try {
+            completeEdit(this, false) // Delete it now.
+          } finally {
+            // Release the editor even if deleting the dirty files failed, so it can't be committed.
+            if (entry.currentEditor == this) {
+              entry.currentEditor = null
+            }
+          }
         } else {
           entry.zombie = true // We can't delete it until the current edit completes.
         }

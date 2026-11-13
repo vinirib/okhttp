@@ -208,8 +208,16 @@ class CacheInterceptor : Interceptor {
             return -1
           }
 
-          sink.copyTo(cacheBody.buffer, sink.size - bytesRead, bytesRead)
-          cacheBody.emitCompleteSegments()
+          try {
+            sink.copyTo(cacheBody.buffer, sink.size - bytesRead, bytesRead)
+            cacheBody.emitCompleteSegments()
+          } catch (e: IOException) {
+            if (!cacheRequestClosed) {
+              cacheRequestClosed = true
+              cacheRequest.abort() // Failed to write a complete cache response.
+            }
+            throw e
+          }
           return bytesRead
         }
 
